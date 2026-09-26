@@ -10,8 +10,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from src.checkpointing import save_checkpoint
+from src.checkpointing import load_model_from_checkpoint, save_checkpoint
 from src.models import RandomForestRouter, create_router, flatten_router_features
+from src.reporting import (experiment_directory, plot_accuracy_curve,
+                           plot_class_frequency, plot_confusion_matrix,
+                           plot_feature_importance, plot_loss_curve,
+                           save_history_csv, save_json)
 from src.routing import read_router_labels, validate_label_rows
 from src.training import Normalization, set_seed
 
@@ -100,25 +104,31 @@ def evaluate_neural(model, loader, device):
 
 def fit_neural_router(model, loader, validation_loader, optimizer, *, epochs,
                       device, output, model_name, config, normalization):
-    history = {"train_loss": [], "validation_loss": [], "validation_accuracy": []}
+    history = {"epoch": [], "train_loss": [], "validation_loss": [],
+               "train_accuracy": [], "validation_accuracy": []}
     best_loss = float("inf")
     for epoch in range(epochs):
         model.train()
-        loss_sum, count = 0.0, 0
+        loss_sum, count, correct = 0.0, 0, 0
         for x, target in loader:
             x, target = x.to(device), target.to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss = nn.functional.cross_entropy(model(x), target)
+            logits = model(x)
+            loss = nn.functional.cross_entropy(logits, target)
             if not torch.isfinite(loss):
                 raise ValueError("non-finite router training loss")
             loss.backward()
             optimizer.step()
             loss_sum += float(loss.detach()) * len(target)
             count += len(target)
+            correct += int((logits.detach().argmax(dim=1) == target).sum())
         if count == 0:
             raise ValueError("router training loader yielded no samples")
-        history["train_loss"].append(loss_sum / count)
-        print(f"Epoch {epoch + 1}/{epochs}: train_loss={loss_sum / count:.6g}")
+        history["epoch"].append(epoch + 1)
+        history["train_loss"].append(float(loss_sum / count))
+        history["train_accuracy"].append(float(correct / count))
+        print(f"Epoch {epoch + 1}/{epochs}: train_loss={loss_sum / count:.6g}, "
+              f"train_accuracy={correct / count:.6g}")
 
         save = epoch + 1 == epochs
         if validation_loader is not None:
@@ -130,6 +140,9 @@ def fit_neural_router(model, loader, validation_loader, optimizer, *, epochs,
             print(f"Validation loss={val_loss:.6g}, accuracy={accuracy:.6g}")
             print("Confusion matrix (true rows, predicted columns):")
             print(confusion)
+        else:
+            history["validation_loss"].append(None)
+            history["validation_accuracy"].append(None)
         if save:
             save_checkpoint(
                 output, model_name=model_name, model_config=config, model=model,
@@ -168,6 +181,7 @@ def main():
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--d-ff", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--experiment-name")
     args = parser.parse_args()
     if args.epochs <= 0 or (args.max_samples is not None and args.max_samples <= 0):
         parser.error("--epochs and --max-samples must be positive")
@@ -184,6 +198,12 @@ def main():
         validation = read_labels(resolve(args.validation_labels), "validation")
         validate_label_rows(h5_path, validation[0], "validation")
     output = resolve(args.output or f"checkpoints/router_{args.router}.pt")
+    experiment_name = args.experiment_name or f"router_{args.router}"
+    experiment = experiment_directory(resolve("outputs/experiments"), experiment_name)
+    save_json(experiment / "config.json", {
+        "kind": "router", "model": args.router, "experiment_name": experiment_name,
+        "arguments": vars(args),
+    })
 
     if args.router == "rf":
         features = load_flat_features(h5_path, ids, normalization)
@@ -193,13 +213,39 @@ def main():
         del features
         output = output.with_suffix(".joblib")
         router.save(output, metadata={"normalization": normalization.to_dict()})
+        result = {
+            "kind": "router", "model": "rf", "validation_accuracy": None,
+            "confusion_matrix": None, "predicted_class_frequency": None,
+            "true_class_frequency": None, "n_estimators": int(args.n_estimators),
+            "max_samples": int(len(ids)), "n_jobs": int(args.n_jobs),
+        }
         if validation is not None:
             from sklearn.metrics import accuracy_score, confusion_matrix
             val_ids, val_labels = validation
             predictions = router.predict(load_flat_features(h5_path, val_ids, normalization))
-            print(f"Validation accuracy: {accuracy_score(val_labels, predictions):.6g}")
+            accuracy = float(accuracy_score(val_labels, predictions))
+            confusion = confusion_matrix(val_labels, predictions, labels=np.arange(4))
+            predicted_frequency = np.bincount(predictions, minlength=4)
+            true_frequency = np.bincount(val_labels, minlength=4)
+            result.update({
+                "validation_accuracy": accuracy,
+                "confusion_matrix": confusion.tolist(),
+                "predicted_class_frequency": predicted_frequency.tolist(),
+                "true_class_frequency": true_frequency.tolist(),
+            })
+            plot_confusion_matrix(experiment / "plots/confusion_matrix.png", confusion)
+            plot_class_frequency(experiment / "plots/class_frequency.png",
+                                 predicted_frequency, true_frequency)
+            print(f"Validation accuracy: {accuracy:.6g}")
             print("Confusion matrix:")
-            print(confusion_matrix(val_labels, predictions, labels=np.arange(4)))
+            print(confusion)
+        importances = getattr(router.model, "feature_importances_", None)
+        if importances is not None and len(importances) % 12 == 0:
+            channel_importance = np.asarray(importances).reshape(-1, 12).sum(axis=0)
+            result["channel_feature_importance"] = channel_importance.tolist()
+            plot_feature_importance(experiment / "plots/feature_importance.png",
+                                    channel_importance, [str(i) for i in range(1, 13)])
+        save_json(experiment / "metrics.json", result)
     else:
         config = (
             {"input_size": 12, "hidden_size": args.hidden_size,
@@ -224,16 +270,44 @@ def main():
             val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                                     num_workers=args.num_workers)
         try:
-            fit_neural_router(
+            history = fit_neural_router(
                 model, loader, val_loader, optimizer, epochs=args.epochs,
                 device=device, output=output, model_name=args.router,
                 config=config, normalization=normalization,
             )
+            save_history_csv(experiment / "history.csv", history)
+            plot_loss_curve(experiment / "plots/loss_curve.png", history,
+                            "Cross-entropy loss")
+            plot_accuracy_curve(experiment / "plots/accuracy_curve.png", history)
+            best_model, best_state = load_model_from_checkpoint(output, device)
+            result = {
+                "kind": "router", "model": args.router,
+                "best_epoch": int(best_state["epoch"]),
+                "validation_loss": None, "validation_accuracy": None,
+                "confusion_matrix": None, "predicted_class_frequency": None,
+                "true_class_frequency": None,
+            }
+            if val_loader is not None:
+                val_loss, accuracy, confusion = evaluate_neural(best_model, val_loader, device)
+                predicted_frequency = confusion.sum(axis=0)
+                true_frequency = confusion.sum(axis=1)
+                result.update({
+                    "validation_loss": float(val_loss),
+                    "validation_accuracy": float(accuracy),
+                    "confusion_matrix": confusion.tolist(),
+                    "predicted_class_frequency": predicted_frequency.tolist(),
+                    "true_class_frequency": true_frequency.tolist(),
+                })
+                plot_confusion_matrix(experiment / "plots/confusion_matrix.png", confusion)
+                plot_class_frequency(experiment / "plots/class_frequency.png",
+                                     predicted_frequency, true_frequency)
+            save_json(experiment / "metrics.json", result)
         finally:
             dataset.close()
             if val_dataset is not None:
                 val_dataset.close()
     print(f"Router artifact: {output}")
+    print(f"Experiment artifacts: {experiment}")
 
 
 if __name__ == "__main__":

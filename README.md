@@ -240,6 +240,29 @@ python -m scripts.predict_test --lstm-checkpoint checkpoints/lstm_best.pt --gru-
 
 Use `--max-batches N` for a bounded smoke run. It warns that the file is partial and reports the number of rows written; keep partial smoke CSVs separate from full submissions.
 
+## Experiment outputs
+
+Training and evaluation commands write compact artifacts under
+`outputs/experiments/<experiment_name>/`: `config.json` records the run settings,
+`history.csv` records epoch history when applicable, `metrics.json` records final
+validation results, and `plots/` contains presentation-ready PNG figures. Names are
+deterministic when `--experiment-name` is omitted.
+
+```text
+python -m scripts.train_expert --model lstm --epochs 20 --experiment-name lstm_baseline
+python -m scripts.train_router --router lstm --labels outputs/router_labels_train.npz --validation-labels outputs/router_labels_validation.npz --experiment-name router_lstm_baseline
+python -m scripts.evaluate_moe --lstm-checkpoint checkpoints/lstm_best.pt --gru-checkpoint checkpoints/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_best.pt --router lstm --router-checkpoint checkpoints/router_lstm.pt --experiment-name moe_lstm_baseline
+```
+
+Create `outputs/experiments/summary.csv` from completed runs with:
+
+```text
+python -m scripts.summarize_experiments
+```
+
+The summary also includes the existing default
+`outputs/persistence_validation.json` artifact when it is present.
+
 ## 17. Generated artifacts
 
 `checkpoints/` stores expert and neural-router `.pt` files and Random Forest `.joblib` files. `outputs/` stores training statistics, persistence and MoE metrics, router-label archives, and test predictions. Generated artifacts and large datasets are excluded from Git.

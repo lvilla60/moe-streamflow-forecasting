@@ -7,8 +7,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.dataset import CaudalDataset
+from src.checkpointing import load_model_from_checkpoint
 from src.models import create_expert
-from src.training import Normalization, fit_expert, set_seed
+from src.reporting import (experiment_directory, plot_horizon_metric, plot_loss_curve,
+                           plot_metric_curve, save_history_csv, save_json)
+from src.training import Normalization, fit_expert, set_seed, validate_expert
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +62,7 @@ def main():
     parser.add_argument("--d-ff", type=int, default=128)
     parser.add_argument("--factor", type=int, default=5)
     parser.add_argument("--label-len", type=int, default=48)
+    parser.add_argument("--experiment-name")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -77,7 +81,7 @@ def main():
             num_workers=args.num_workers,
         )
         checkpoint = resolve(args.checkpoint_dir) / f"{args.model}_best.pt"
-        fit_expert(
+        history = fit_expert(
             model, train_loader, validation_loader, normalization,
             model_name=args.model, model_config=config, epochs=args.epochs,
             learning_rate=args.learning_rate, weight_decay=args.weight_decay,
@@ -89,7 +93,41 @@ def main():
             checkpoint_path=checkpoint,
             resume_checkpoint=None if args.resume is None else resolve(args.resume),
         )
+        experiment_name = args.experiment_name or f"expert_{args.model}"
+        experiment = experiment_directory(resolve("outputs/experiments"), experiment_name)
+        save_json(experiment / "config.json", {
+            "kind": "expert", "model": args.model, "experiment_name": experiment_name,
+            "arguments": vars(args), "model_config": config,
+        })
+        save_history_csv(experiment / "history.csv", history)
+        plot_loss_curve(experiment / "plots/loss_curve.png", history, "MSE loss")
+        for metric in ("mae", "rmse", "nse"):
+            plot_metric_curve(
+                experiment / f"plots/{metric}_by_epoch.png", history,
+                f"validation_{metric}", metric.upper(),
+            )
+
+        best_model, best_state = load_model_from_checkpoint(checkpoint, args.device)
+        validation_loss, metrics, per_horizon = validate_expert(
+            best_model, validation_loader, normalization, torch.device(args.device),
+            args.max_validation_batches, include_per_horizon=True,
+        )
+        result = {
+            "kind": "expert", "model": args.model,
+            "best_epoch": int(best_state["epoch"]),
+            "validation_loss": float(validation_loss),
+            "MAE": float(metrics["mae"]), "RMSE": float(metrics["rmse"]),
+            "NSE": float(metrics["nse"]),
+            "per_horizon_mae": per_horizon["mae"],
+            "per_horizon_rmse": per_horizon["rmse"],
+        }
+        save_json(experiment / "metrics.json", result)
+        plot_horizon_metric(experiment / "plots/mae_by_horizon.png",
+                            result["per_horizon_mae"], "MAE")
+        plot_horizon_metric(experiment / "plots/rmse_by_horizon.png",
+                            result["per_horizon_rmse"], "RMSE")
         print(f"Best checkpoint: {checkpoint}")
+        print(f"Experiment artifacts: {experiment}")
     finally:
         train_data.close()
         validation_data.close()

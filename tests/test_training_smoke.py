@@ -1,4 +1,6 @@
 import torch
+import json
+import sys
 from torch.utils.data import DataLoader, Dataset
 
 from src.checkpointing import load_model_from_checkpoint, save_checkpoint
@@ -19,6 +21,9 @@ class TinyForecastDataset(Dataset):
 
     def __getitem__(self, index):
         return {"X": self.x[index], "y": self.y[index], "Id": index, "basin_id": 0}
+
+    def close(self):
+        pass
 
 
 def normalization():
@@ -63,3 +68,35 @@ def test_explicit_checkpoint_round_trip(tmp_path):
     restored, _ = load_model_from_checkpoint(path)
     x = torch.randn(2, 10, 12)
     torch.testing.assert_close(model(x), restored(x))
+
+
+def test_expert_cli_smoke_creates_experiment_artifacts(tmp_path, monkeypatch):
+    from scripts import train_expert
+
+    stats_path = tmp_path / "stats.json"
+    stats_path.write_text(json.dumps({
+        "split": "train", "x": {"mean": [0.0] * 12, "std": [1.0] * 12},
+        "y": {"mean": 0.0, "std": 1.0},
+    }))
+    monkeypatch.setattr(train_expert, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        train_expert, "CaudalDataset",
+        lambda *args, **kwargs: TinyForecastDataset(size=4, history=6, horizon=48),
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "train_expert", "--model", "lstm", "--epochs", "1", "--batch-size", "2",
+        "--hidden-size", "4", "--dropout", "0", "--stats", str(stats_path),
+        "--max-train-batches", "1", "--max-validation-batches", "1",
+        "--experiment-name", "synthetic_expert", "--checkpoint-dir", "checkpoints",
+    ])
+    train_expert.main()
+    experiment = tmp_path / "outputs" / "experiments" / "synthetic_expert"
+    assert (experiment / "config.json").exists()
+    assert (experiment / "history.csv").exists()
+    metrics = json.loads((experiment / "metrics.json").read_text())
+    assert metrics["model"] == "lstm"
+    assert len(metrics["per_horizon_mae"]) == 48
+    assert {path.name for path in (experiment / "plots").iterdir()} == {
+        "loss_curve.png", "mae_by_epoch.png", "rmse_by_epoch.png",
+        "nse_by_epoch.png", "mae_by_horizon.png", "rmse_by_horizon.png",
+    }

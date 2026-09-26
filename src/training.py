@@ -145,6 +145,40 @@ class RegressionAccumulator:
         }
 
 
+class HorizonRegressionAccumulator:
+    """Per-horizon MAE and RMSE using memory proportional to the horizon."""
+
+    def __init__(self):
+        self.count = 0
+        self.absolute_error = None
+        self.squared_error = None
+
+    def update(self, target, prediction):
+        target = np.asarray(target, dtype=np.float64)
+        prediction = np.asarray(prediction, dtype=np.float64)
+        if target.shape != prediction.shape or target.ndim != 2:
+            raise ValueError("per-horizon metrics require matching [batch, horizon] arrays")
+        if target.size == 0 or not (np.isfinite(target).all() and np.isfinite(prediction).all()):
+            raise ValueError("metrics require nonempty, finite targets and predictions")
+        error = target - prediction
+        if self.absolute_error is None:
+            self.absolute_error = np.zeros(target.shape[1], dtype=np.float64)
+            self.squared_error = np.zeros(target.shape[1], dtype=np.float64)
+        if target.shape[1] != len(self.absolute_error):
+            raise ValueError("forecast horizon changed during evaluation")
+        self.absolute_error += np.abs(error).sum(axis=0)
+        self.squared_error += np.square(error).sum(axis=0)
+        self.count += target.shape[0]
+
+    def finalize(self):
+        if self.count == 0:
+            raise ValueError("cannot finalize empty metrics")
+        return {
+            "mae": (self.absolute_error / self.count).tolist(),
+            "rmse": np.sqrt(self.squared_error / self.count).tolist(),
+        }
+
+
 def train_one_epoch(model, loader, optimizer, normalization, device,
                     teacher_forcing_ratio=0.0, gradient_clip=None,
                     max_batches=None):
@@ -178,11 +212,13 @@ def train_one_epoch(model, loader, optimizer, normalization, device,
 
 
 @torch.no_grad()
-def validate_expert(model, loader, normalization, device, max_batches=None):
+def validate_expert(model, loader, normalization, device, max_batches=None,
+                    include_per_horizon=False):
     model.eval()
     total_loss = 0.0
     total_values = 0
     metrics = RegressionAccumulator()
+    horizon_metrics = HorizonRegressionAccumulator() if include_per_horizon else None
     for batch_index, batch in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
             break
@@ -198,12 +234,15 @@ def validate_expert(model, loader, normalization, device, max_batches=None):
         total_loss += float(loss) * values
         total_values += values
         physical_prediction = normalization.inverse_y(prediction)
-        metrics.update(
-            prepared["raw_y"].cpu().numpy(), physical_prediction.cpu().numpy()
-        )
+        raw_target = prepared["raw_y"].cpu().numpy()
+        physical_prediction = physical_prediction.cpu().numpy()
+        metrics.update(raw_target, physical_prediction)
+        if horizon_metrics is not None:
+            horizon_metrics.update(raw_target, physical_prediction)
     if total_values == 0:
         raise ValueError("validation loader yielded no batches")
-    return total_loss / total_values, metrics.finalize()
+    result = (total_loss / total_values, metrics.finalize())
+    return (*result, horizon_metrics.finalize()) if horizon_metrics is not None else result
 
 
 def fit_expert(model, train_loader, validation_loader, normalization, *, model_name,
@@ -216,7 +255,8 @@ def fit_expert(model, train_loader, validation_loader, normalization, *, model_n
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
-    history = {"train_loss": [], "validation_loss": []}
+    history = {"epoch": [], "train_loss": [], "validation_loss": [],
+               "validation_mae": [], "validation_rmse": [], "validation_nse": []}
     best_loss = float("inf")
     start_epoch = 0
     if resume_checkpoint is not None:
@@ -243,6 +283,12 @@ def fit_expert(model, train_loader, validation_loader, normalization, *, model_n
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(resume_checkpoint, destination)
 
+    completed_epochs = len(history.get("train_loss", []))
+    history.setdefault("epoch", list(range(1, completed_epochs + 1)))
+    history.setdefault("validation_mae", [None] * completed_epochs)
+    history.setdefault("validation_rmse", [None] * completed_epochs)
+    history.setdefault("validation_nse", [None] * completed_epochs)
+
     for epoch in range(start_epoch, epochs):
         train_loss = train_one_epoch(
             model, train_loader, optimizer, normalization, device,
@@ -251,8 +297,12 @@ def fit_expert(model, train_loader, validation_loader, normalization, *, model_n
         validation_loss, physical_metrics = validate_expert(
             model, validation_loader, normalization, device, max_validation_batches
         )
-        history["train_loss"].append(train_loss)
+        history["epoch"].append(epoch + 1)
+        history["train_loss"].append(float(train_loss))
         history["validation_loss"].append(validation_loss)
+        history["validation_mae"].append(float(physical_metrics["mae"]))
+        history["validation_rmse"].append(float(physical_metrics["rmse"]))
+        history["validation_nse"].append(float(physical_metrics["nse"]))
         if validation_loss < best_loss:
             best_loss = validation_loss
             if checkpoint_path is not None:

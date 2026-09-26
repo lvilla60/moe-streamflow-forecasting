@@ -11,8 +11,11 @@ from torch.utils.data import DataLoader
 from src.dataset import CaudalDataset
 from src.inference import load_experts, load_router_artifact, predict_router_classes
 from src.models import select_expert_predictions
+from src.reporting import (experiment_directory, plot_class_frequency,
+                           plot_confusion_matrix, plot_horizon_metric, save_json)
 from src.routing import predict_expert_stack, read_router_labels, validate_label_rows
-from src.training import RegressionAccumulator, prepare_batch
+from src.training import (HorizonRegressionAccumulator, RegressionAccumulator,
+                          prepare_batch)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +41,7 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--max-batches", type=int)
     parser.add_argument("--output", default="outputs/moe_validation.json")
+    parser.add_argument("--experiment-name")
     args = parser.parse_args()
     if args.max_batches is not None and args.max_batches <= 0:
         parser.error("--max-batches must be positive")
@@ -60,6 +64,7 @@ def main():
 
     dataset = CaudalDataset(resolve(args.input), split="validation")
     metrics = RegressionAccumulator()
+    horizon_metrics = HorizonRegressionAccumulator()
     frequencies = np.zeros(4, dtype=np.int64)
     confusion = np.zeros((4, 4), dtype=np.int64) if label_lookup is not None else None
     try:
@@ -77,7 +82,10 @@ def main():
                 prediction = normalization.inverse_y(
                     select_expert_predictions(expert_stack, classes)
                 )
-                metrics.update(prepared["raw_y"].cpu().numpy(), prediction.cpu().numpy())
+                raw_target = prepared["raw_y"].cpu().numpy()
+                physical_prediction = prediction.cpu().numpy()
+                metrics.update(raw_target, physical_prediction)
+                horizon_metrics.update(raw_target, physical_prediction)
                 class_array = classes.cpu().numpy()
                 frequencies += np.bincount(class_array, minlength=4)
                 if label_lookup is not None:
@@ -90,10 +98,18 @@ def main():
     finally:
         dataset.close()
 
+    global_metrics = metrics.finalize()
+    per_horizon = horizon_metrics.finalize()
     result = {
+        "kind": "moe", "model": f"moe_{args.router}",
         "split": "validation",
         "n_samples": int(frequencies.sum()),
-        "global": metrics.finalize(),
+        "global": global_metrics,
+        "MAE": float(global_metrics["mae"]),
+        "RMSE": float(global_metrics["rmse"]),
+        "NSE": float(global_metrics["nse"]),
+        "per_horizon_mae": per_horizon["mae"],
+        "per_horizon_rmse": per_horizon["rmse"],
         "router_class_frequencies": frequencies.tolist(),
     }
     if confusion is not None:
@@ -104,11 +120,25 @@ def main():
         result["router_unlabeled_samples"] = int(frequencies.sum()) - matched
         print(f"Router classification metrics cover {matched}/{int(frequencies.sum())} evaluated rows")
     output = resolve(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    save_json(output, result)
+    experiment_name = args.experiment_name or f"moe_{args.router}"
+    experiment = experiment_directory(resolve("outputs/experiments"), experiment_name)
+    save_json(experiment / "config.json", {
+        "kind": "moe", "model": f"moe_{args.router}",
+        "experiment_name": experiment_name, "arguments": vars(args),
+    })
+    save_json(experiment / "metrics.json", result)
+    plot_horizon_metric(experiment / "plots/mae_by_horizon.png",
+                        result["per_horizon_mae"], "MAE")
+    plot_horizon_metric(experiment / "plots/rmse_by_horizon.png",
+                        result["per_horizon_rmse"], "RMSE")
+    plot_class_frequency(experiment / "plots/router_class_frequency.png", frequencies)
+    if confusion is not None:
+        plot_confusion_matrix(experiment / "plots/router_confusion_matrix.png", confusion)
     print(json.dumps(result["global"], indent=2))
     print(f"Router class frequencies: {frequencies.tolist()}")
     print(f"Output: {output}")
+    print(f"Experiment artifacts: {experiment}")
 
 
 if __name__ == "__main__":
