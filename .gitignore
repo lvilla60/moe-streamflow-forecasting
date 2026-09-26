@@ -11,3 +11,6 @@ checkpoints/*
 
 outputs/*
 !outputs/.gitkeep
+
+# Internal documentation
+ARCHITECTURE.md
