@@ -263,6 +263,111 @@ python -m scripts.summarize_experiments
 The summary also includes the existing default
 `outputs/persistence_validation.json` artifact when it is present.
 
+## Khipu / SLURM
+
+### Quick start for collaborators
+
+For execution or testing on Khipu, use `main`: clone the `main` branch, or update an
+existing checkout before submitting jobs.
+
+```sh
+git checkout main
+git pull
+
+sbatch slurm/check_environment.sbatch
+sbatch slurm/smoke_gpu.sbatch
+```
+
+Use the provided `slurm/*.sbatch` wrappers. Do not modify `src/models/`,
+`src/training.py`, preprocessing, dataset split logic, or normalization logic merely
+to run an experiment. Change experiment parameters through `sbatch --export`
+variables instead. Heavy `Input/*.h5` files are transferred separately, and generated
+logs, checkpoints, and outputs remain outside normal source commits.
+
+For execution and testing, use `main`. For code development, create a feature branch
+and submit a Pull Request.
+
+Clone the repository on Khipu, enter its root, and create the planned Python 3.11
+environment:
+
+```sh
+git clone --branch main https://github.com/lvilla60/moe-streamflow-forecasting.git
+cd moe-streamflow-forecasting
+module purge
+module load gnu12/12.4.0
+module load python3/3.11.11
+module load cuda/12.8
+python3 -m venv "$HOME/.venvs/moe-streamflow-py311-gnu12-cu128"
+source "$HOME/.venvs/moe-streamflow-py311-gnu12-cu128/bin/activate"
+python -m pip install --upgrade pip
+```
+
+Install a PyTorch 2.11 or newer build compatible with CUDA 12.8 using the current
+Khipu-approved installation method, then install the project requirements. Because
+`requirements.txt` does not pin a CUDA wheel, an already compatible PyTorch install
+is retained.
+
+```sh
+python -m pip install -r requirements.txt
+```
+
+Transfer `Input/train-001.h5`, `Input/test.h5`, and `Input/metadata.json` separately;
+they are intentionally outside version control. Also transfer the existing
+`outputs/train_stats.json`, or generate it once from the training split with
+`python -m scripts.compute_train_stats`. Never place test targets in the project.
+Create the scheduler log directory before the first submission:
+
+```sh
+mkdir -p Input outputs logs
+```
+
+Check the loaded environment and run the bounded CUDA smoke job:
+
+```sh
+sbatch slurm/check_environment.sbatch
+sbatch slurm/smoke_gpu.sbatch
+```
+
+Submit one expert per job. The default checkpoint directory is
+`checkpoints/<experiment_name>/`.
+
+```sh
+sbatch --export=ALL,MODEL=lstm,EXPERIMENT_NAME=lstm_baseline slurm/train_expert.sbatch
+sbatch --export=ALL,MODEL=gru,EXPERIMENT_NAME=gru_baseline slurm/train_expert.sbatch
+sbatch --export=ALL,MODEL=seq2seq_attention,EXPERIMENT_NAME=seq2seq_baseline slurm/train_expert.sbatch
+sbatch --export=ALL,MODEL=informer,EXPERIMENT_NAME=informer_baseline slurm/train_expert.sbatch
+```
+
+Generate labels for both official splits after all expert checkpoints exist:
+
+```sh
+sbatch --export=ALL,SPLIT=train,OUTPUT=outputs/router_labels_train.npz slurm/generate_router_labels.sbatch
+sbatch --export=ALL,SPLIT=validation,OUTPUT=outputs/router_labels_validation.npz slurm/generate_router_labels.sbatch
+```
+
+Train routers with the generated labels:
+
+```sh
+sbatch --export=ALL,ROUTER=rf,DEVICE=cpu,EXPERIMENT_NAME=router_rf_baseline slurm/train_router.sbatch
+sbatch --export=ALL,ROUTER=lstm,EXPERIMENT_NAME=router_lstm_baseline slurm/train_router.sbatch
+sbatch --export=ALL,ROUTER=transformer,EXPERIMENT_NAME=router_transformer_baseline slurm/train_router.sbatch
+```
+
+The reusable router script requests one GPU because `#SBATCH` directives are parsed
+before exported variables. RF itself runs on CPU; sites that require strict CPU-only
+allocation can copy the resource header and remove the GPU directives.
+
+Evaluate an MoE on the official validation split by selecting its router artifact:
+
+```sh
+sbatch --export=ALL,ROUTER=lstm,EXPERIMENT_NAME=moe_lstm_baseline slurm/evaluate_moe.sbatch
+```
+
+All wrappers may be edited for site-specific walltimes. Common settings such as
+`BATCH_SIZE`, `NUM_WORKERS`, checkpoint paths, and experiment names can be overridden
+with `sbatch --export=ALL,...`. Logs are written to `logs/`, checkpoints to
+`checkpoints/`, and reports to `outputs/experiments/`.
+
 ## 17. Generated artifacts
 
 `checkpoints/` stores expert and neural-router `.pt` files and Random Forest `.joblib` files. `outputs/` stores training statistics, persistence and MoE metrics, router-label archives, and test predictions. Generated artifacts and large datasets are excluded from Git.
