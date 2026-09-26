@@ -52,9 +52,13 @@ BirdSong is only an infrastructure reference for Khipu/SLURM and is not part of 
 
 ## Testing
 
-Run from the repository root:
+Run project modules from the repository root using `python -m ...`. Do not execute files inside `scripts/` directly.
+
+Run tests and the real-data smoke test from the repository root:
 
 ```text
 python -m pytest -q
 python -m tests.smoke_real_dataset
+python -m scripts.compute_train_stats
+python -m scripts.evaluate_persistence
 ```
