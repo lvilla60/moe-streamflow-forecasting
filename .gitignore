@@ -17,3 +17,5 @@ outputs/*
 
 # Internal documentation
 ARCHITECTURE.md
+
+*.tar.gz
