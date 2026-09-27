@@ -255,13 +255,19 @@ Evaluation reports physical-unit MAE, RMSE, NSE, and router class frequencies. W
 
 ## 16. Test prediction
 
-Test inference reads `test.h5` without targets and writes `outputs/test_predictions.csv` with columns `Id`, `q_01`, …, `q_48`:
+Test inference reads `test.h5` without targets and writes `outputs/test_predictions.csv` with columns `Id`, `q_01`, …, `q_48`. For direct execution from the repository root:
 
-```text
-python -m scripts.predict_test --lstm-checkpoint checkpoints/lstm_baseline/lstm_best.pt --gru-checkpoint checkpoints/gru_baseline/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_baseline/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_baseline/informer_best.pt --router lstm --router-checkpoint checkpoints/router_lstm.pt
+```sh
+PYTHONPATH=. python scripts/predict_test.py --lstm-checkpoint checkpoints/lstm_baseline/lstm_best.pt --gru-checkpoint checkpoints/gru_baseline/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_baseline/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_baseline/informer_best.pt --router lstm --router-checkpoint checkpoints/router_lstm.pt
 ```
 
 Use `--max-batches N` for a bounded smoke run. It warns that the file is partial and reports the number of rows written; keep partial smoke CSVs separate from full submissions.
+
+For reproducible Khipu execution, use `slurm/predict_test.sbatch` as shown below.
+The course provider confirmed that `test_targets.csv` row `Id=i` corresponds
+exactly to `test.h5` input `X[i]`. Separately provided test targets supply ground
+truth for final evaluation only; use validation for model selection. Keep test
+targets outside version control; they are not part of the public repository.
 
 ## Experiment outputs
 
@@ -306,6 +312,20 @@ Use the provided `slurm/*.sbatch` wrappers. Do not modify `src/models/`,
 to run an experiment. Change experiment parameters through `sbatch --export`
 variables instead. Heavy `Input/*.h5` files are transferred separately, and generated
 logs, checkpoints, and outputs remain outside normal source commits.
+
+Set comma-separated `EXPERTS` in the shell environment and inherit it with
+`sbatch --export=ALL`. Commas inside `--export` separate variable assignments and
+can truncate an expert subset to one expert. Quoting the `--export` argument does
+not change SLURM's comma parsing.
+
+For HDF5-heavy Khipu jobs, `NUM_WORKERS=0` is recommended: multiprocessing workers
+previously triggered "Too many open files". Export it before submitting the jobs
+below; the test-prediction wrapper also defaults to zero. This is a Khipu
+operational setting, not a universal requirement outside Khipu.
+
+```sh
+export NUM_WORKERS=0
+```
 
 For execution and testing, use `main`. For code development, create a feature branch
 and submit a Pull Request.
@@ -375,10 +395,14 @@ Generate labels for the paper ablation (`EXPERTS=lstm,informer`) and best-expert
 ablation (`EXPERTS=lstm,gru`) with the reusable wrapper:
 
 ```sh
-sbatch --export=ALL,EXPERTS=lstm,informer,SPLIT=train,OUTPUT=outputs/router_labels_lstm_informer_train.npz slurm/generate_router_labels.sbatch
-sbatch --export=ALL,EXPERTS=lstm,informer,SPLIT=validation,OUTPUT=outputs/router_labels_lstm_informer_validation.npz slurm/generate_router_labels.sbatch
-sbatch --export=ALL,EXPERTS=lstm,gru,SPLIT=train,OUTPUT=outputs/router_labels_lstm_gru_train.npz slurm/generate_router_labels.sbatch
-sbatch --export=ALL,EXPERTS=lstm,gru,SPLIT=validation,OUTPUT=outputs/router_labels_lstm_gru_validation.npz slurm/generate_router_labels.sbatch
+EXPERTS="lstm,informer" SPLIT=train OUTPUT=outputs/router_labels_lstm_informer_train.npz \
+sbatch --export=ALL slurm/generate_router_labels.sbatch
+EXPERTS="lstm,informer" SPLIT=validation OUTPUT=outputs/router_labels_lstm_informer_validation.npz \
+sbatch --export=ALL slurm/generate_router_labels.sbatch
+EXPERTS="lstm,gru" SPLIT=train OUTPUT=outputs/router_labels_lstm_gru_train.npz \
+sbatch --export=ALL slurm/generate_router_labels.sbatch
+EXPERTS="lstm,gru" SPLIT=validation OUTPUT=outputs/router_labels_lstm_gru_validation.npz \
+sbatch --export=ALL slurm/generate_router_labels.sbatch
 ```
 
 Train routers with the generated labels:
@@ -398,6 +422,57 @@ Evaluate an MoE on the official validation split by selecting its router artifac
 ```sh
 sbatch --export=ALL,ROUTER=lstm,EXPERIMENT_NAME=moe_lstm_baseline slurm/evaluate_moe.sbatch
 ```
+
+### Test prediction
+
+Submit from the repository root after creating `logs/` and training the matching
+router. The native wrapper uses the same Khipu modules and virtual environment as
+MoE evaluation. It requires an explicit `OUTPUT` and refuses an existing path;
+prediction creates the output's parent directory.
+
+LSTM + Informer:
+
+```sh
+EXPERTS="lstm,informer" \
+ROUTER="lstm" \
+ROUTER_CHECKPOINT="checkpoints/router_lstm_informer/router_lstm.pt" \
+OUTPUT="outputs/final_results/test_predictions_lstm_informer.csv" \
+NUM_WORKERS="0" \
+sbatch --export=ALL slurm/predict_test.sbatch
+```
+
+LSTM + GRU:
+
+```sh
+EXPERTS="lstm,gru" \
+ROUTER="lstm" \
+ROUTER_CHECKPOINT="checkpoints/router_lstm_gru/router_lstm.pt" \
+OUTPUT="outputs/final_results/test_predictions_lstm_gru.csv" \
+NUM_WORKERS="0" \
+sbatch --export=ALL slurm/predict_test.sbatch
+```
+
+The default LSTM router checkpoint is
+`checkpoints/router_lstm_baseline/router_lstm.pt`. To use that four-expert artifact:
+
+```sh
+EXPERTS="lstm,gru,seq2seq,informer" \
+ROUTER="lstm" \
+ROUTER_CHECKPOINT="checkpoints/router_lstm_baseline/router_lstm.pt" \
+OUTPUT="outputs/final_results/test_predictions_four_experts.csv" \
+NUM_WORKERS="0" \
+sbatch --export=ALL slurm/predict_test.sbatch
+```
+
+If `EXPERTS` is omitted, inference uses the router artifact's ordered mapping;
+when supplied, it must match exactly. Expert checkpoint defaults are the baseline
+paths shown above; override them with `LSTM_CHECKPOINT`, `GRU_CHECKPOINT`,
+`SEQ2SEQ_CHECKPOINT`, and `INFORMER_CHECKPOINT`. Only selected experts are loaded.
+Other defaults are `INPUT=Input/test.h5`, `BATCH_SIZE=64`, `NUM_WORKERS=0`, and
+`DEVICE=cuda`. `MAX_BATCHES` is unset for full prediction; use `MAX_BATCHES=1`
+with a distinct output for a smoke run. `DEVICE=cpu` is supported, but the SLURM
+header still requests a GPU. Set `PROJECT_ROOT` when submitting outside the
+repository root, and `VENV_PATH` to override the shared virtual environment.
 
 All wrappers may be edited for site-specific walltimes. Common settings such as
 `BATCH_SIZE`, `NUM_WORKERS`, checkpoint paths, and experiment names can be overridden

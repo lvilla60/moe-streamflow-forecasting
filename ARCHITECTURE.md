@@ -51,14 +51,20 @@ Input channels with zero standard deviation use a divisor of one. Target standar
 
 ## Router-label generation
 
-After all four experts are trained and frozen, each known-target sample is evaluated by every expert. For sample `i` and expert `e`:
+After the selected experts are trained and frozen, each known-target sample is evaluated by every selected expert. For sample `i` and expert `e`:
 
 ```text
 error(i, e) = mean(abs(y_true[i, :] - y_pred[e, i, :]))
 best_expert(i) = argmin_e error(i, e)
 ```
 
-The class order is fixed:
+Canonical public expert names are `lstm`, `gru`, `seq2seq`, and `informer`.
+`seq2seq` maps to the internal model/checkpoint name `seq2seq_attention`. A subset
+contains at least two distinct experts, and its requested order defines local,
+contiguous router class IDs `0..N-1`. For `EXPERTS="lstm,informer"`, class 0 means
+LSTM and class 1 means Informer; global four-expert numbering does not apply.
+
+The default four-expert order is:
 
 ```text
 0 = LSTM
@@ -67,29 +73,73 @@ The class order is fixed:
 3 = Informer
 ```
 
-Ties select the first class. Generated label artifacts store `Id`, `basin_id`, `best_expert`, and four expert errors; historical arrays are referenced by row and are not duplicated. Router training labels must use only the official training split.
+Ties select the first local class. Generated label artifacts store `Id`, `basin_id`, `best_expert`, the ordered `expert_names`, and one error column per selected expert; historical arrays are referenced by row and are not duplicated. Router training labels must use only the official training split.
 
 `Id` is the original zero-based HDF5 row, not an index within a filtered split. Label readers validate the class order, unique integer IDs, and class bounds, and check referenced rows against the official split before router training/evaluation. Default filenames distinguish train and validation labels. Artifacts do not fingerprint HDF5 contents or exact expert weights; keep the dataset and expert versions together and regenerate labels after changing experts. Training labels are generated in-sample from trained experts, which can bias expert preferences; held-out validation remains essential.
 
 ## Routers
 
 - **Random Forest:** scikit-learn classifier over the flattened normalized history `[B, 336 * 12]`.
-- **LSTM router:** LSTM sequence encoder with a four-class linear head.
-- **Transformer router:** projected inputs, sinusoidal positions, standard Transformer encoder, mean pooling, and a four-class head.
+- **LSTM router:** LSTM sequence encoder with an N-class linear head, where N is the number of selected experts.
+- **Transformer router:** projected inputs, sinusoidal positions, standard Transformer encoder, mean pooling, and an N-class head.
 
 Random Forest flattening is an initial adaptation and can be memory intensive, so its training CLI supports a sample cap. Router inference uses historical inputs only and never derives classes from future targets.
 
-For 254,000 histories, the float32 RF matrix contains 1,024,128,000 values (4.10 GB / 3.82 GiB) before forest and worker allocations. Feature preparation now allocates one matrix and normalizes small chunks in place, prints a memory estimate, and warns on large allocations. Use `--max-samples` and limit `--n-jobs` to fit the available RAM; this is still in-memory RF training. `predict_proba` always uses columns 0–3, including zero columns for unseen classes.
+For 254,000 histories, the float32 RF matrix contains 1,024,128,000 values (4.10 GB / 3.82 GiB) before forest and worker allocations. Feature preparation now allocates one matrix and normalizes small chunks in place, prints a memory estimate, and warns on large allocations. Use `--max-samples` and limit `--n-jobs` to fit the available RAM; this is still in-memory RF training. `predict_proba` uses all local columns `0..N-1`, including zero columns for unseen classes.
 
 Neural routers supplied with `--validation-labels` calculate validation cross-entropy, accuracy, and a confusion matrix every epoch under `no_grad`. The saved checkpoint is selected by the lowest validation loss. With no validation labels, the final model is saved with `selection=final_epoch` and `best_validation_loss=None`; training loss is never reported as validation loss.
 
+Neural checkpoints and RF artifact metadata carry the ordered `expert_names`
+mapping and normalization values. Inference reconstructs the selected expert list
+from this mapping and checks its length against the router's class count. An
+explicit `--experts` must match the stored names and order exactly. The loader
+supports legacy four-class artifacts without `expert_names` by using the default
+four-expert order, and recognizes the historical full mapping containing
+`seq2seq_attention`. Subset artifacts require explicit mapping metadata.
+
 ## Hard MoE inference
 
-The initial MoE uses one router class per sample. All four experts may be run for reproducibility, producing `[B, 4, 48]`; the selected class gathers one complete forecast and returns `[B, 48]`. Soft routing and lead-time routing are outside the initial implementation.
+MoE inference uses one local router class per sample. Only the selected experts
+are loaded, in artifact order, and all selected experts run to produce
+`[B, N, 48]`. The selected class gathers one complete forecast and returns
+`[B, 48]`. Soft routing and lead-time routing are outside the implementation.
+
+```text
+test.h5: X [B, 336, 12], basin_id
+    |
+    v
+preprocessing with training statistics stored in checkpoints
+    |
+    +--> selected Expert 0 --+
+    +--> selected Expert 1 --+--> expert forecasts [B, N, 48] --+
+    +--> ... ---------------+                                 |
+    |                                                         v
+    +--> Router --> local expert index [B] ----------> Hard-MoE selection
+                                                              |
+                                                              v
+                                                  inverse target normalization
+                                                              |
+                                                              v
+                                                48-step physical-unit forecast
+```
+
+The router consumes normalized history, independently of the expert forecasts.
+Router and expert normalization metadata must agree; no statistics are fitted
+on test inputs.
 
 Validation calculates physical-unit MAE, RMSE, and NSE and records router class frequencies. If validation best-expert labels are supplied, router accuracy and a confusion matrix are also reported. Test inference writes `Id` and `q_01` through `q_48` without reading `test_targets.csv`.
 
 Partial validation label files are supported: forecast metrics cover all evaluated rows, classification metrics cover the intersection, and matched/unmatched sample counts are reported. Router accuracy is `null` if there are no matching labels. Test prediction supports `--max-batches N` for debugging, warns that the CSV may be partial, and reports the actual row count. Without the flag it processes the complete test split. Use a separate smoke-output filename to avoid confusing a partial file with a submission.
+
+## Final test evaluation
+
+`test.h5` provides `X` and `basin_id`; separately supplied `test_targets.csv`
+provides the target truth for evaluation. The course provider has confirmed
+`Id=i` in the target CSV corresponds exactly to `test.h5` row `X[i]`. Prediction
+preserves that original row ID in its CSV, allowing evaluation to join forecasts
+and targets by `Id`. Test data is reserved for final evaluation; validation
+governs model and checkpoint selection. Test targets remain outside version
+control and are not an input to `scripts/predict_test.py`.
 
 ## Methodological adaptations
 
@@ -103,4 +153,32 @@ Partial validation label files are supported: forecast metrics cover all evaluat
 
 ## Portability
 
-Project modules are run from the repository root with `python -m ...`; no import-path modifications are used. The implementation targets Python 3.10 with CPU PyTorch locally and Python 3.11 with PyTorch 2.11 and CUDA 12.8 on Khipu. Devices are selected by configuration, and no CUDA-only code path is required. Seeding covers Python, NumPy, torch, and available CUDA devices as a best-effort reproducibility measure without forcing unsupported deterministic kernels.
+Project modules are run from the repository root with `python -m ...`. Direct
+execution of `scripts/predict_test.py` requires the root on `PYTHONPATH`. The
+implementation targets Python 3.10 with CPU PyTorch locally and Python 3.11 with
+PyTorch 2.11 and CUDA 12.8 on Khipu. Devices are selected by configuration, and no
+CUDA-only code path is required. Seeding covers Python, NumPy, torch, and available
+CUDA devices as a best-effort reproducibility measure without forcing unsupported
+deterministic kernels.
+
+### Khipu execution layer
+
+`slurm/` supplies native wrappers for expert training (`train_expert.sbatch`),
+router-label generation (`generate_router_labels.sbatch`), router training
+(`train_router.sbatch`), validation MoE evaluation (`evaluate_moe.sbatch`), and
+test prediction (`predict_test.sbatch`). These adapt scheduling, modules, virtual
+environment activation, and environment variables to `scripts/`; model and
+inference implementations remain in the shared Python code.
+
+The prediction wrapper resolves the repository root from `PROJECT_ROOT`, then
+`SLURM_SUBMIT_DIR`, or its own location for direct Bash execution. It changes to
+that root and prepends it to `PYTHONPATH`. A Bash array carries arguments without
+splitting the ordered `EXPERTS` value. Submission passes comma-separated subsets
+through shell environment assignments inherited by `sbatch --export=ALL`.
+The wrapper requires a new explicit output path to protect existing predictions.
+
+Multi-worker HDF5 jobs on Khipu encountered file-descriptor exhaustion ("Too many
+open files"). `NUM_WORKERS=0` is an operational safeguard and the prediction
+wrapper's default; supply it explicitly for other HDF5-heavy Khipu wrappers,
+which retain their existing defaults. Worker counts remain configurable for
+other environments. This deployment setting does not change the model design.
