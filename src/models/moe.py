@@ -27,8 +27,8 @@ class HardMoE(nn.Module):
 
     def __init__(self, experts, router):
         super().__init__()
-        if len(experts) != 4:
-            raise ValueError("HardMoE requires exactly four experts")
+        if len(experts) < 2:
+            raise ValueError("HardMoE requires at least two experts")
         self.experts = nn.ModuleList(experts)
         self.router = router
 

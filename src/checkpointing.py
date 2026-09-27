@@ -9,10 +9,11 @@ from .models import create_expert, create_router
 
 def save_checkpoint(path, *, model_name, model_config, model, optimizer=None,
                     epoch=0, best_validation_loss=float("inf"), normalization=None,
-                    training_history=None, model_kind="expert", selection="validation_loss"):
+                    training_history=None, model_kind="expert", selection="validation_loss",
+                    expert_names=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    checkpoint = {
         "model_kind": model_kind,
         "model_name": model_name,
         "model_config": dict(model_config),
@@ -24,7 +25,10 @@ def save_checkpoint(path, *, model_name, model_config, model, optimizer=None,
         "selection": selection,
         "normalization": normalization,
         "training_history": training_history or {"train_loss": [], "validation_loss": []},
-    }, path)
+    }
+    if expert_names is not None:
+        checkpoint["expert_names"] = list(expert_names)
+    torch.save(checkpoint, path)
 
 
 def load_checkpoint(path, model=None, optimizer=None, map_location="cpu"):

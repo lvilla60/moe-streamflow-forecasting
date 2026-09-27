@@ -29,7 +29,7 @@ X [B, 336, 12]
     |
     +--> LSTM --------------------+
     +--> GRU ---------------------+
-    +--> LSTM-S2S-Attention ------+--> expert forecasts [B, 4, 48]
+    +--> LSTM-S2S-Attention ------+--> expert forecasts [B, N, 48]
     +--> Informer ----------------+
                                    |
                           best-expert labels
@@ -69,6 +69,8 @@ error(i, e) = mean(abs(y_true[i, :] - y_pred[e, i, :]))
 best_expert(i) = argmin_e error(i, e)
 ```
 
+For the default four-expert configuration, the local class mapping is:
+
 | Class | Expert |
 |---:|---|
 | 0 | LSTM |
@@ -76,19 +78,23 @@ best_expert(i) = argmin_e error(i, e)
 | 2 | LSTM-S2S-Attention |
 | 3 | Informer |
 
+For expert subsets, class indices are reassigned locally and contiguously in the
+requested expert order. For example, `lstm,informer` maps class 0 to LSTM and class 1
+to Informer.
+
 Generate training labels from the official training split. Validation labels are optional and are only for evaluation or validation-based router selection. Label files store original HDF5 row `Id`, `basin_id`, class, and expert errors; they do not duplicate input arrays.
 
 ## 6. Routers
 
 - **Random Forest:** scikit-learn `RandomForestClassifier` on flattened normalized history `[336 * 12]`. Full training can require several GiB for features plus forest and worker memory. Use `--max-samples` to limit rows and reduce `--n-jobs` when memory is constrained.
-- **LSTM router:** LSTM sequence encoder with a four-class output head.
-- **Transformer router:** input projection, positional encoding, Transformer encoder, pooled sequence representation, and four-class output head.
+- **LSTM router:** LSTM sequence encoder with an N-class output head, where N is the number of selected experts.
+- **Transformer router:** input projection, positional encoding, Transformer encoder, pooled representation, and an N-class output head.
 
 For neural routers, supplying validation labels evaluates each epoch and selects the checkpoint with the lowest validation loss. Without validation labels, the final epoch is saved and is not validation-selected.
 
 ## 7. Hard MoE inference
 
-The experts produce `[B, 4, 48]` and the router produces one class per sample `[B]`. A hard gather selects one expert forecast and returns `[B, 48]`; there is no soft averaging. The implementation may run all four experts before selecting one. The chosen forecast is inverse-transformed to physical discharge units.
+The selected expert subset is loaded in the ordered mapping stored in the router artifact. The experts produce `[B, N, 48]`, where N is the number of experts in the selected subset, and the router produces one class per sample `[B]`. Hard routing selects one expert per sample and returns `[B, 48]`; there is no soft averaging. The chosen forecast is inverse-transformed to physical discharge units.
 
 ## 8. Repository structure
 
@@ -197,16 +203,33 @@ python -m scripts.train_expert --model lstm --epochs 1 --batch-size 2 --max-trai
 Provide the four expert checkpoints in class order. Training labels:
 
 ```text
-python -m scripts.generate_router_labels --split train --lstm-checkpoint checkpoints/lstm_best.pt --gru-checkpoint checkpoints/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_best.pt
+python -m scripts.generate_router_labels --split train --lstm-checkpoint checkpoints/lstm_baseline/lstm_best.pt --gru-checkpoint checkpoints/gru_baseline/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_baseline/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_baseline/informer_best.pt
 ```
 
 Validation labels:
 
 ```text
-python -m scripts.generate_router_labels --split validation --lstm-checkpoint checkpoints/lstm_best.pt --gru-checkpoint checkpoints/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_best.pt
+python -m scripts.generate_router_labels --split validation --lstm-checkpoint checkpoints/lstm_baseline/lstm_best.pt --gru-checkpoint checkpoints/gru_baseline/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_baseline/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_baseline/informer_best.pt
 ```
 
 Default outputs are `outputs/router_labels_train.npz` and `outputs/router_labels_validation.npz`. Use these generated files with the corresponding split; label IDs are checked against the official HDF5 split.
+
+### Expert subsets
+
+Router labels, routers, MoE evaluation, and test prediction support ordered expert
+subsets. The default remains `lstm,gru,seq2seq,informer`. Paper and best-expert
+ablations use `--experts lstm,informer` and `--experts lstm,gru`, respectively.
+Router class indices are local and contiguous in the requested order: for
+`lstm,informer`, class 0 is LSTM and class 1 is Informer.
+
+```text
+python -m scripts.generate_router_labels --experts lstm,informer --split train --lstm-checkpoint checkpoints/lstm_baseline/lstm_best.pt --informer-checkpoint checkpoints/informer_baseline/informer_best.pt
+python -m scripts.generate_router_labels --experts lstm,gru --split train --lstm-checkpoint checkpoints/lstm_baseline/lstm_best.pt --gru-checkpoint checkpoints/gru_baseline/gru_best.pt
+```
+
+The trained router artifact stores this mapping. `evaluate_moe.py` and
+`predict_test.py` reconstruct it automatically; an optional `--experts` value is
+checked against the stored order.
 
 ## 14. Train a router
 
@@ -222,10 +245,10 @@ Validation labels are recommended for neural-router checkpoint selection. RF fea
 
 ## 15. Evaluate the MoE
 
-Supply four expert checkpoints and one router artifact. `--validation-labels` is optional and enables router accuracy and confusion-matrix reporting.
+Supply the expert checkpoints selected by the router artifact and one router artifact. `--validation-labels` is optional and enables router accuracy and confusion-matrix reporting.
 
 ```text
-python -m scripts.evaluate_moe --lstm-checkpoint checkpoints/lstm_best.pt --gru-checkpoint checkpoints/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_best.pt --router lstm --router-checkpoint checkpoints/router_lstm.pt --validation-labels outputs/router_labels_validation.npz
+python -m scripts.evaluate_moe --lstm-checkpoint checkpoints/lstm_baseline/lstm_best.pt --gru-checkpoint checkpoints/gru_baseline/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_baseline/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_baseline/informer_best.pt --router lstm --router-checkpoint checkpoints/router_lstm.pt --validation-labels outputs/router_labels_validation.npz
 ```
 
 Evaluation reports physical-unit MAE, RMSE, NSE, and router class frequencies. With validation labels it also reports classification accuracy and a confusion matrix; partial label files report their matched-row coverage.
@@ -235,7 +258,7 @@ Evaluation reports physical-unit MAE, RMSE, NSE, and router class frequencies. W
 Test inference reads `test.h5` without targets and writes `outputs/test_predictions.csv` with columns `Id`, `q_01`, …, `q_48`:
 
 ```text
-python -m scripts.predict_test --lstm-checkpoint checkpoints/lstm_best.pt --gru-checkpoint checkpoints/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_best.pt --router lstm --router-checkpoint checkpoints/router_lstm.pt
+python -m scripts.predict_test --lstm-checkpoint checkpoints/lstm_baseline/lstm_best.pt --gru-checkpoint checkpoints/gru_baseline/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_baseline/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_baseline/informer_best.pt --router lstm --router-checkpoint checkpoints/router_lstm.pt
 ```
 
 Use `--max-batches N` for a bounded smoke run. It warns that the file is partial and reports the number of rows written; keep partial smoke CSVs separate from full submissions.
@@ -251,7 +274,7 @@ deterministic when `--experiment-name` is omitted.
 ```text
 python -m scripts.train_expert --model lstm --epochs 20 --experiment-name lstm_baseline
 python -m scripts.train_router --router lstm --labels outputs/router_labels_train.npz --validation-labels outputs/router_labels_validation.npz --experiment-name router_lstm_baseline
-python -m scripts.evaluate_moe --lstm-checkpoint checkpoints/lstm_best.pt --gru-checkpoint checkpoints/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_best.pt --router lstm --router-checkpoint checkpoints/router_lstm.pt --experiment-name moe_lstm_baseline
+python -m scripts.evaluate_moe --lstm-checkpoint checkpoints/lstm_baseline/lstm_best.pt --gru-checkpoint checkpoints/gru_baseline/gru_best.pt --seq2seq-checkpoint checkpoints/seq2seq_baseline/seq2seq_attention_best.pt --informer-checkpoint checkpoints/informer_baseline/informer_best.pt --router lstm --router-checkpoint checkpoints/router_lstm.pt --experiment-name moe_lstm_baseline
 ```
 
 Create `outputs/experiments/summary.csv` from completed runs with:
@@ -314,7 +337,10 @@ python -m pip install -r requirements.txt
 Transfer `Input/train-001.h5`, `Input/test.h5`, and `Input/metadata.json` separately;
 they are intentionally outside version control. Also transfer the existing
 `outputs/train_stats.json`, or generate it once from the training split with
-`python -m scripts.compute_train_stats`. Never place test targets in the project.
+`python -m scripts.compute_train_stats`. If test targets are provided separately, keep
+them outside version control. They may be placed locally under `Input/` for final
+evaluation, but must not be committed to Git.
+
 Create the scheduler log directory before the first submission:
 
 ```sh
@@ -343,6 +369,16 @@ Generate labels for both official splits after all expert checkpoints exist:
 ```sh
 sbatch --export=ALL,SPLIT=train,OUTPUT=outputs/router_labels_train.npz slurm/generate_router_labels.sbatch
 sbatch --export=ALL,SPLIT=validation,OUTPUT=outputs/router_labels_validation.npz slurm/generate_router_labels.sbatch
+```
+
+Generate labels for the paper ablation (`EXPERTS=lstm,informer`) and best-expert
+ablation (`EXPERTS=lstm,gru`) with the reusable wrapper:
+
+```sh
+sbatch --export=ALL,EXPERTS=lstm,informer,SPLIT=train,OUTPUT=outputs/router_labels_lstm_informer_train.npz slurm/generate_router_labels.sbatch
+sbatch --export=ALL,EXPERTS=lstm,informer,SPLIT=validation,OUTPUT=outputs/router_labels_lstm_informer_validation.npz slurm/generate_router_labels.sbatch
+sbatch --export=ALL,EXPERTS=lstm,gru,SPLIT=train,OUTPUT=outputs/router_labels_lstm_gru_train.npz slurm/generate_router_labels.sbatch
+sbatch --export=ALL,EXPERTS=lstm,gru,SPLIT=validation,OUTPUT=outputs/router_labels_lstm_gru_validation.npz slurm/generate_router_labels.sbatch
 ```
 
 Train routers with the generated labels:

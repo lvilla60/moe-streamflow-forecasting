@@ -66,4 +66,5 @@ set -- python -m scripts.train_router \
 
 if [ -n "$VALIDATION_LABELS" ]; then set -- "$@" --validation-labels "$VALIDATION_LABELS"; fi
 if [ -n "${MAX_SAMPLES:-}" ]; then set -- "$@" --max-samples "$MAX_SAMPLES"; fi
+if [ -n "${EXPERTS:-}" ]; then set -- "$@" --experts "$EXPERTS"; fi
 "$@"

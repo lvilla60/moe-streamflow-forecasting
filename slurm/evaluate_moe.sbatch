@@ -46,9 +46,7 @@ INFORMER_CHECKPOINT="${INFORMER_CHECKPOINT:-checkpoints/informer_baseline/inform
 VALIDATION_LABELS="${VALIDATION_LABELS-outputs/router_labels_validation.npz}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-moe_${ROUTER}_baseline}"
 
-for artifact in "$ROUTER_CHECKPOINT" "$LSTM_CHECKPOINT" "$GRU_CHECKPOINT" "$SEQ2SEQ_CHECKPOINT" "$INFORMER_CHECKPOINT"; do
-    if [ ! -f "$artifact" ]; then echo "Required checkpoint not found: $artifact" >&2; exit 1; fi
-done
+if [ ! -f "$ROUTER_CHECKPOINT" ]; then echo "Router checkpoint not found: $ROUTER_CHECKPOINT" >&2; exit 1; fi
 if [ -n "$VALIDATION_LABELS" ] && [ ! -f "$VALIDATION_LABELS" ]; then
     echo "Validation labels not found: $VALIDATION_LABELS" >&2
     exit 1
@@ -64,4 +62,5 @@ set -- python -m scripts.evaluate_moe \
     --experiment-name "$EXPERIMENT_NAME"
 
 if [ -n "$VALIDATION_LABELS" ]; then set -- "$@" --validation-labels "$VALIDATION_LABELS"; fi
+if [ -n "${EXPERTS:-}" ]; then set -- "$@" --experts "$EXPERTS"; fi
 "$@"

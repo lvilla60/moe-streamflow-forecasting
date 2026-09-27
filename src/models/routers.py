@@ -12,7 +12,7 @@ from .common import SinusoidalPositionalEncoding, validate_sequence
 EXPERT_CLASSES = {
     0: "lstm",
     1: "gru",
-    2: "seq2seq_attention",
+    2: "seq2seq",
     3: "informer",
 }
 
@@ -25,8 +25,12 @@ def flatten_router_features(x):
 
 
 class RandomForestRouter:
-    def __init__(self, n_estimators=100, random_state=42, n_jobs=-1, **kwargs):
+    def __init__(self, n_estimators=100, random_state=42, n_jobs=-1,
+                 num_classes=4, **kwargs):
+        if not isinstance(num_classes, int) or num_classes < 2:
+            raise ValueError("num_classes must be an integer of at least 2")
         from sklearn.ensemble import RandomForestClassifier
+        self.num_classes = num_classes
         self.model = RandomForestClassifier(
             n_estimators=n_estimators, random_state=random_state, n_jobs=n_jobs, **kwargs
         )
@@ -34,8 +38,11 @@ class RandomForestRouter:
 
     def fit(self, features, labels):
         labels = np.asarray(labels)
-        if labels.dtype.kind not in "iu" or np.any(labels < 0) or np.any(labels >= 4):
-            raise ValueError("RF labels must be integer expert classes 0..3")
+        if (labels.dtype.kind not in "iu" or np.any(labels < 0)
+                or np.any(labels >= self.num_classes)):
+            raise ValueError(
+                f"RF labels must be integer expert classes 0..{self.num_classes - 1}"
+            )
         self.model.fit(features, labels)
         return self
 
@@ -43,8 +50,9 @@ class RandomForestRouter:
         return self.model.predict(features)
 
     def predict_proba(self, features):
-        # sklearn omits unobserved classes; expose stable columns 0, 1, 2, 3.
-        probabilities = np.zeros((len(features), 4), dtype=np.float64)
+        # sklearn omits unobserved classes; expose every configured local class.
+        num_classes = getattr(self, "num_classes", 4)
+        probabilities = np.zeros((len(features), num_classes), dtype=np.float64)
         probabilities[:, self.model.classes_.astype(int)] = self.model.predict_proba(features)
         return probabilities
 

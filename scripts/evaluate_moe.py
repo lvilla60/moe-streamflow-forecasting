@@ -13,7 +13,9 @@ from src.inference import load_experts, load_router_artifact, predict_router_cla
 from src.models import select_expert_predictions
 from src.reporting import (experiment_directory, plot_class_frequency,
                            plot_confusion_matrix, plot_horizon_metric, save_json)
-from src.routing import predict_expert_stack, read_router_labels, validate_label_rows
+from src.routing import (parse_expert_subset, predict_expert_stack,
+                         read_router_labels, require_matching_expert_names,
+                         validate_label_rows)
 from src.training import (HorizonRegressionAccumulator, RegressionAccumulator,
                           prepare_batch)
 
@@ -29,10 +31,11 @@ def resolve(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", default="Input/train-001.h5")
-    parser.add_argument("--lstm-checkpoint", required=True)
-    parser.add_argument("--gru-checkpoint", required=True)
-    parser.add_argument("--seq2seq-checkpoint", required=True)
-    parser.add_argument("--informer-checkpoint", required=True)
+    parser.add_argument("--experts", help="ordered subset; must match router metadata")
+    parser.add_argument("--lstm-checkpoint")
+    parser.add_argument("--gru-checkpoint")
+    parser.add_argument("--seq2seq-checkpoint")
+    parser.add_argument("--informer-checkpoint")
     parser.add_argument("--router", required=True, choices=("rf", "lstm", "transformer"))
     parser.add_argument("--router-checkpoint", required=True)
     parser.add_argument("--validation-labels")
@@ -47,26 +50,60 @@ def main():
         parser.error("--max-batches must be positive")
 
     device = torch.device(args.device)
-    expert_paths = [resolve(path) for path in (
-        args.lstm_checkpoint, args.gru_checkpoint,
-        args.seq2seq_checkpoint, args.informer_checkpoint,
-    )]
-    experts, normalization = load_experts(expert_paths, device)
-    router, _ = load_router_artifact(
-        args.router, resolve(args.router_checkpoint), device, normalization
+    router, router_normalization, expert_names = load_router_artifact(
+        args.router, resolve(args.router_checkpoint), device,
+        return_expert_names=True,
     )
+    if args.experts:
+        try:
+            requested_experts = parse_expert_subset(args.experts)
+        except ValueError as error:
+            parser.error(str(error))
+        try:
+            require_matching_expert_names(
+                expert_names, requested_experts, "--experts and router artifact expert_names"
+            )
+        except ValueError as error:
+            parser.error(str(error))
+    checkpoint_by_name = {
+        "lstm": args.lstm_checkpoint, "gru": args.gru_checkpoint,
+        "seq2seq": args.seq2seq_checkpoint, "informer": args.informer_checkpoint,
+    }
+    missing = [name for name in expert_names if not checkpoint_by_name[name]]
+    if missing:
+        parser.error(f"missing checkpoint argument(s) for routed experts: {missing}")
+    expert_paths = [resolve(checkpoint_by_name[name]) for name in expert_names]
+    missing_paths = [str(path) for path in expert_paths if not path.is_file()]
+    if missing_paths:
+        parser.error(f"routed expert checkpoint(s) not found: {missing_paths}")
+    experts, normalization = load_experts(
+        expert_paths, device, expert_names=expert_names
+    )
+    if router_normalization != normalization.to_dict():
+        raise ValueError("router and experts use different normalization statistics")
 
     label_lookup = None
     if args.validation_labels:
-        ids, labels = read_router_labels(resolve(args.validation_labels), "validation")
+        ids, labels, label_expert_names = read_router_labels(
+            resolve(args.validation_labels), "validation", return_expert_names=True
+        )
+        try:
+            require_matching_expert_names(
+                expert_names, label_expert_names,
+                "validation labels and router artifact expert_names",
+            )
+        except ValueError as error:
+            parser.error(str(error))
         validate_label_rows(resolve(args.input), ids, "validation")
         label_lookup = dict(zip(ids.tolist(), labels.tolist()))
 
     dataset = CaudalDataset(resolve(args.input), split="validation")
     metrics = RegressionAccumulator()
     horizon_metrics = HorizonRegressionAccumulator()
-    frequencies = np.zeros(4, dtype=np.int64)
-    confusion = np.zeros((4, 4), dtype=np.int64) if label_lookup is not None else None
+    num_classes = len(expert_names)
+    frequencies = np.zeros(num_classes, dtype=np.int64)
+    confusion = (np.zeros((num_classes, num_classes), dtype=np.int64)
+                 if label_lookup is not None else None)
     try:
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers)
@@ -87,7 +124,7 @@ def main():
                 metrics.update(raw_target, physical_prediction)
                 horizon_metrics.update(raw_target, physical_prediction)
                 class_array = classes.cpu().numpy()
-                frequencies += np.bincount(class_array, minlength=4)
+                frequencies += np.bincount(class_array, minlength=num_classes)
                 if label_lookup is not None:
                     # Regression metrics cover every evaluated row; classification
                     # metrics cover only the intersection with supplied labels.
@@ -111,6 +148,7 @@ def main():
         "per_horizon_mae": per_horizon["mae"],
         "per_horizon_rmse": per_horizon["rmse"],
         "router_class_frequencies": frequencies.tolist(),
+        "expert_names": list(expert_names),
     }
     if confusion is not None:
         matched = int(confusion.sum())
@@ -132,9 +170,11 @@ def main():
                         result["per_horizon_mae"], "MAE")
     plot_horizon_metric(experiment / "plots/rmse_by_horizon.png",
                         result["per_horizon_rmse"], "RMSE")
-    plot_class_frequency(experiment / "plots/router_class_frequency.png", frequencies)
+    plot_class_frequency(experiment / "plots/router_class_frequency.png", frequencies,
+                         class_labels=expert_names)
     if confusion is not None:
-        plot_confusion_matrix(experiment / "plots/router_confusion_matrix.png", confusion)
+        plot_confusion_matrix(experiment / "plots/router_confusion_matrix.png", confusion,
+                              expert_names)
     print(json.dumps(result["global"], indent=2))
     print(f"Router class frequencies: {frequencies.tolist()}")
     print(f"Output: {output}")

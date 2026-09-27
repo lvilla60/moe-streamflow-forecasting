@@ -2,6 +2,7 @@
 
 import json
 import sys
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -222,9 +223,30 @@ def patch_inference_cli(monkeypatch, module, output, extra_args):
         instances.append(instance)
         return instance
 
+    unused = output.parent / "unused"
+    unused.write_bytes(b"placeholder")
+
+    def resolve(path):
+        path = Path(path)
+        if path.is_absolute():
+            return path
+        if path.as_posix() == "outputs/experiments":
+            return output.parent / "experiments"
+        return unused
+
+    monkeypatch.setattr(
+        module, "resolve", resolve,
+    )
+
     monkeypatch.setattr(module, "CaudalDataset", dataset)
-    monkeypatch.setattr(module, "load_experts", lambda *args: ([SimpleNamespace(forecast_horizon=48)] * 4, stats()))
-    monkeypatch.setattr(module, "load_router_artifact", lambda *args: (object(), stats().to_dict()))
+    monkeypatch.setattr(
+        module, "load_experts",
+        lambda *args, **kwargs: ([SimpleNamespace(forecast_horizon=48)] * 4, stats()),
+    )
+    monkeypatch.setattr(
+        module, "load_router_artifact",
+        lambda *args, **kwargs: (object(), stats().to_dict(), EXPERT_NAMES),
+    )
     monkeypatch.setattr(module, "predict_router_classes", lambda router, x: torch.zeros(len(x), dtype=torch.long))
     monkeypatch.setattr(module, "predict_expert_stack", lambda experts, x, start: torch.zeros(len(x), 4, 48))
     monkeypatch.setattr(sys, "argv", ["script", "--lstm-checkpoint", "unused", "--gru-checkpoint", "unused",

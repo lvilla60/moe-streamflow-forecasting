@@ -7,25 +7,82 @@ import h5py
 from .training import forward_expert
 
 
-EXPERT_NAMES = ("lstm", "gru", "seq2seq_attention", "informer")
+EXPERT_NAMES = ("lstm", "gru", "seq2seq", "informer")
+LEGACY_EXPERT_NAMES = ("lstm", "gru", "seq2seq_attention", "informer")
+EXPERT_MODEL_NAMES = {
+    "lstm": "lstm",
+    "gru": "gru",
+    "seq2seq": "seq2seq_attention",
+    "informer": "informer",
+}
 
 
-def read_router_labels(path, required_split):
-    """Read labels in original-row order and enforce the fixed class mapping."""
+def parse_expert_subset(value=None):
+    """Return a validated, ordered tuple of public expert names."""
+    if value is None:
+        names = EXPERT_NAMES
+    elif isinstance(value, str):
+        names = tuple(name.strip() for name in value.split(","))
+    else:
+        names = tuple(str(name) for name in value)
+    if len(names) < 2:
+        raise ValueError("at least two experts are required for routing")
+    if any(not name for name in names):
+        raise ValueError("expert names cannot be empty")
+    unknown = [name for name in names if name not in EXPERT_NAMES]
+    if unknown:
+        raise ValueError(
+            f"unknown expert name(s) {unknown}; expected names from {list(EXPERT_NAMES)}"
+        )
+    if len(set(names)) != len(names):
+        raise ValueError("expert names must not contain duplicates")
+    return names
+
+
+def normalize_stored_expert_names(raw_names):
+    """Validate stored metadata, including the historical Seq2Seq name."""
+    names = tuple(str(name) for name in raw_names)
+    if names == LEGACY_EXPERT_NAMES:
+        return EXPERT_NAMES
+    return parse_expert_subset(names)
+
+
+def require_matching_expert_names(reference, candidate, description="expert mappings"):
+    reference = parse_expert_subset(reference)
+    candidate = parse_expert_subset(candidate)
+    if candidate != reference:
+        raise ValueError(f"{description} must match exactly and preserve order")
+    return reference
+
+
+def read_router_labels(path, required_split, return_expert_names=False):
+    """Read labels in original-row order and validate their local class mapping."""
     with np.load(path, allow_pickle=False) as data:
+        required = {"split", "expert_names", "Id", "best_expert"}
+        missing = sorted(required.difference(data.files))
+        if missing:
+            raise ValueError(f"router labels are missing required fields: {missing}")
         if str(data["split"].item()) != required_split:
             raise ValueError(f"expected {required_split} labels")
-        if tuple(data["expert_names"].tolist()) != EXPERT_NAMES:
-            raise ValueError("router label expert_names do not match the class mapping")
+        raw_names = data["expert_names"]
+        if raw_names.ndim != 1:
+            raise ValueError("expert_names must be a one-dimensional ordered array")
+        expert_names = normalize_stored_expert_names(raw_names.tolist())
         ids, labels = data["Id"].copy(), data["best_expert"].copy()
+        errors = data["expert_errors"].copy() if "expert_errors" in data.files else None
     if (ids.ndim != 1 or labels.shape != ids.shape or not len(ids)
             or ids.dtype.kind not in "iu" or labels.dtype.kind not in "iu"):
         raise ValueError("Id and best_expert must be nonempty integer vectors of equal length")
     if (np.any(ids < 0) or len(np.unique(ids)) != len(ids)
-            or np.any(labels < 0) or np.any(labels >= len(EXPERT_NAMES))):
+            or np.any(labels < 0) or np.any(labels >= len(expert_names))):
         raise ValueError("invalid/duplicate Id or best_expert outside class range")
+    if errors is not None:
+        if (errors.shape != (len(ids), len(expert_names))
+                or errors.dtype.kind not in "fiu" or not np.isfinite(errors).all()):
+            raise ValueError("expert_errors must be finite with one column per expert_name")
     order = np.argsort(ids)
-    return ids[order], labels[order]
+    result = (ids[order], labels[order])
+    return (*result, expert_names) if return_expert_names else result
 
 
 def validate_label_rows(h5_path, ids, split):
@@ -66,8 +123,8 @@ def best_expert_labels(y_true, expert_predictions):
 
 @torch.no_grad()
 def predict_expert_stack(experts, x, decoder_start):
-    if len(experts) != 4:
-        raise ValueError("exactly four experts are required in class-map order")
+    if not experts:
+        raise ValueError("at least one expert is required")
     for expert in experts:
         expert.eval()
     predictions = [

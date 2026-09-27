@@ -16,7 +16,8 @@ from src.reporting import (experiment_directory, plot_accuracy_curve,
                            plot_class_frequency, plot_confusion_matrix,
                            plot_feature_importance, plot_loss_curve,
                            save_history_csv, save_json)
-from src.routing import read_router_labels, validate_label_rows
+from src.routing import (parse_expert_subset, read_router_labels,
+                         require_matching_expert_names, validate_label_rows)
 from src.training import Normalization, set_seed
 
 
@@ -61,7 +62,7 @@ class LabelledSequenceDataset(Dataset):
 
 
 def read_labels(path, required_split):
-    return read_router_labels(path, required_split)
+    return read_router_labels(path, required_split, return_expert_names=True)
 
 
 def load_flat_features(h5_path, ids, normalization, chunk_size=256):
@@ -90,10 +91,18 @@ def load_flat_features(h5_path, ids, normalization, chunk_size=256):
 def evaluate_neural(model, loader, device):
     model.eval()
     loss_sum, count = 0.0, 0
-    confusion = np.zeros((4, 4), dtype=np.int64)
+    confusion = None
     for x, labels in loader:
         x, labels = x.to(device), labels.to(device)
         logits = model(x)
+        if logits.ndim != 2 or logits.shape[1] < 2:
+            raise ValueError("router must produce at least two class logits")
+        if confusion is None:
+            confusion = np.zeros((logits.shape[1], logits.shape[1]), dtype=np.int64)
+        elif logits.shape[1] != confusion.shape[0]:
+            raise ValueError("router class count changed during evaluation")
+        if torch.any(labels < 0) or torch.any(labels >= logits.shape[1]):
+            raise ValueError("router label is outside the configured class range")
         loss_sum += float(nn.functional.cross_entropy(logits, labels, reduction="sum"))
         count += len(labels)
         np.add.at(confusion, (labels.cpu().numpy(), logits.argmax(dim=1).cpu().numpy()), 1)
@@ -103,7 +112,8 @@ def evaluate_neural(model, loader, device):
 
 
 def fit_neural_router(model, loader, validation_loader, optimizer, *, epochs,
-                      device, output, model_name, config, normalization):
+                      device, output, model_name, config, normalization,
+                      expert_names=None):
     history = {"epoch": [], "train_loss": [], "validation_loss": [],
                "train_accuracy": [], "validation_accuracy": []}
     best_loss = float("inf")
@@ -151,6 +161,7 @@ def fit_neural_router(model, loader, validation_loader, optimizer, *, epochs,
                 normalization=normalization.to_dict(), training_history=history,
                 model_kind="router",
                 selection="validation_loss" if validation_loader is not None else "final_epoch",
+                expert_names=expert_names,
             )
     print("Saved best validation checkpoint" if validation_loader is not None
           else "No validation labels supplied: saved final model (not validation-selected)")
@@ -164,6 +175,7 @@ def main():
     parser.add_argument("--stats", default="outputs/train_stats.json")
     parser.add_argument("--labels", default="outputs/router_labels_train.npz")
     parser.add_argument("--validation-labels")
+    parser.add_argument("--experts", help="validate labels against this ordered subset")
     parser.add_argument("--output")
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--epochs", type=int, default=10)
@@ -189,53 +201,79 @@ def main():
     set_seed(args.seed)
     h5_path = resolve(args.input)
     normalization = Normalization.from_json(resolve(args.stats))
-    ids, labels = read_labels(resolve(args.labels), "train")
+    ids, labels, expert_names = read_labels(resolve(args.labels), "train")
+    if args.experts:
+        try:
+            requested_experts = parse_expert_subset(args.experts)
+        except ValueError as error:
+            parser.error(str(error))
+        try:
+            require_matching_expert_names(
+                expert_names, requested_experts, "--experts and training-label expert_names"
+            )
+        except ValueError as error:
+            parser.error(str(error))
+    num_classes = len(expert_names)
     validate_label_rows(h5_path, ids, "train")
     if args.max_samples is not None:
         ids, labels = ids[:args.max_samples], labels[:args.max_samples]
     validation = None
     if args.validation_labels:
         validation = read_labels(resolve(args.validation_labels), "validation")
+        try:
+            require_matching_expert_names(
+                expert_names, validation[2], "training and validation label expert_names"
+            )
+        except ValueError as error:
+            parser.error(str(error))
         validate_label_rows(h5_path, validation[0], "validation")
     output = resolve(args.output or f"checkpoints/router_{args.router}.pt")
     experiment_name = args.experiment_name or f"router_{args.router}"
     experiment = experiment_directory(resolve("outputs/experiments"), experiment_name)
     save_json(experiment / "config.json", {
         "kind": "router", "model": args.router, "experiment_name": experiment_name,
-        "arguments": vars(args),
+        "arguments": vars(args), "expert_names": list(expert_names),
     })
 
     if args.router == "rf":
         features = load_flat_features(h5_path, ids, normalization)
         router = RandomForestRouter(
-            n_estimators=args.n_estimators, random_state=args.seed, n_jobs=args.n_jobs
+            n_estimators=args.n_estimators, random_state=args.seed, n_jobs=args.n_jobs,
+            num_classes=num_classes,
         ).fit(features, labels)
         del features
         output = output.with_suffix(".joblib")
-        router.save(output, metadata={"normalization": normalization.to_dict()})
+        router.save(output, metadata={
+            "normalization": normalization.to_dict(),
+            "expert_names": list(expert_names),
+        })
         result = {
             "kind": "router", "model": "rf", "validation_accuracy": None,
             "confusion_matrix": None, "predicted_class_frequency": None,
             "true_class_frequency": None, "n_estimators": int(args.n_estimators),
             "max_samples": int(len(ids)), "n_jobs": int(args.n_jobs),
+            "expert_names": list(expert_names),
         }
         if validation is not None:
             from sklearn.metrics import accuracy_score, confusion_matrix
-            val_ids, val_labels = validation
+            val_ids, val_labels, _ = validation
             predictions = router.predict(load_flat_features(h5_path, val_ids, normalization))
             accuracy = float(accuracy_score(val_labels, predictions))
-            confusion = confusion_matrix(val_labels, predictions, labels=np.arange(4))
-            predicted_frequency = np.bincount(predictions, minlength=4)
-            true_frequency = np.bincount(val_labels, minlength=4)
+            confusion = confusion_matrix(
+                val_labels, predictions, labels=np.arange(num_classes)
+            )
+            predicted_frequency = np.bincount(predictions, minlength=num_classes)
+            true_frequency = np.bincount(val_labels, minlength=num_classes)
             result.update({
                 "validation_accuracy": accuracy,
                 "confusion_matrix": confusion.tolist(),
                 "predicted_class_frequency": predicted_frequency.tolist(),
                 "true_class_frequency": true_frequency.tolist(),
             })
-            plot_confusion_matrix(experiment / "plots/confusion_matrix.png", confusion)
+            plot_confusion_matrix(experiment / "plots/confusion_matrix.png", confusion,
+                                  expert_names)
             plot_class_frequency(experiment / "plots/class_frequency.png",
-                                 predicted_frequency, true_frequency)
+                                 predicted_frequency, true_frequency, expert_names)
             print(f"Validation accuracy: {accuracy:.6g}")
             print("Confusion matrix:")
             print(confusion)
@@ -249,11 +287,12 @@ def main():
     else:
         config = (
             {"input_size": 12, "hidden_size": args.hidden_size,
-             "num_layers": args.layers, "dropout": args.dropout, "num_classes": 4}
+             "num_layers": args.layers, "dropout": args.dropout,
+             "num_classes": num_classes}
             if args.router == "lstm" else
             {"input_size": 12, "d_model": args.d_model, "n_heads": args.heads,
              "num_layers": args.layers, "d_ff": args.d_ff,
-             "dropout": args.dropout, "num_classes": 4}
+             "dropout": args.dropout, "num_classes": num_classes}
         )
         device = torch.device(args.device)
         model = create_router(args.router, **config).to(device)
@@ -265,7 +304,7 @@ def main():
                             num_workers=args.num_workers)
         val_dataset, val_loader = None, None
         if validation is not None:
-            val_ids, val_labels = validation
+            val_ids, val_labels, _ = validation
             val_dataset = LabelledSequenceDataset(h5_path, val_ids, val_labels, normalization)
             val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                                     num_workers=args.num_workers)
@@ -274,6 +313,7 @@ def main():
                 model, loader, val_loader, optimizer, epochs=args.epochs,
                 device=device, output=output, model_name=args.router,
                 config=config, normalization=normalization,
+                expert_names=expert_names,
             )
             save_history_csv(experiment / "history.csv", history)
             plot_loss_curve(experiment / "plots/loss_curve.png", history,
@@ -286,6 +326,7 @@ def main():
                 "validation_loss": None, "validation_accuracy": None,
                 "confusion_matrix": None, "predicted_class_frequency": None,
                 "true_class_frequency": None,
+                "expert_names": list(expert_names),
             }
             if val_loader is not None:
                 val_loss, accuracy, confusion = evaluate_neural(best_model, val_loader, device)
@@ -298,9 +339,10 @@ def main():
                     "predicted_class_frequency": predicted_frequency.tolist(),
                     "true_class_frequency": true_frequency.tolist(),
                 })
-                plot_confusion_matrix(experiment / "plots/confusion_matrix.png", confusion)
+                plot_confusion_matrix(experiment / "plots/confusion_matrix.png", confusion,
+                                      expert_names)
                 plot_class_frequency(experiment / "plots/class_frequency.png",
-                                     predicted_frequency, true_frequency)
+                                     predicted_frequency, true_frequency, expert_names)
             save_json(experiment / "metrics.json", result)
         finally:
             dataset.close()

@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from src.dataset import CaudalDataset
 from src.inference import load_experts
-from src.routing import EXPERT_NAMES, best_expert_labels, predict_expert_stack
+from src.routing import best_expert_labels, parse_expert_subset, predict_expert_stack
 from src.training import Normalization, prepare_batch
 
 
@@ -25,10 +25,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", default="Input/train-001.h5")
     parser.add_argument("--split", choices=("train", "validation"), default="train")
-    parser.add_argument("--lstm-checkpoint", required=True)
-    parser.add_argument("--gru-checkpoint", required=True)
-    parser.add_argument("--seq2seq-checkpoint", required=True)
-    parser.add_argument("--informer-checkpoint", required=True)
+    parser.add_argument("--experts", help="ordered comma-separated expert subset")
+    parser.add_argument("--lstm-checkpoint")
+    parser.add_argument("--gru-checkpoint")
+    parser.add_argument("--seq2seq-checkpoint")
+    parser.add_argument("--informer-checkpoint")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="cpu")
@@ -38,12 +39,27 @@ def main():
     if args.max_batches is not None and args.max_batches <= 0:
         parser.error("--max-batches must be positive")
 
+    try:
+        expert_names = parse_expert_subset(args.experts)
+    except ValueError as error:
+        parser.error(str(error))
+    checkpoint_by_name = {
+        "lstm": args.lstm_checkpoint,
+        "gru": args.gru_checkpoint,
+        "seq2seq": args.seq2seq_checkpoint,
+        "informer": args.informer_checkpoint,
+    }
+    missing = [name for name in expert_names if not checkpoint_by_name[name]]
+    if missing:
+        parser.error(f"missing checkpoint argument(s) for selected experts: {missing}")
     device = torch.device(args.device)
-    checkpoint_paths = (
-        args.lstm_checkpoint, args.gru_checkpoint,
-        args.seq2seq_checkpoint, args.informer_checkpoint,
+    checkpoint_paths = [resolve(checkpoint_by_name[name]) for name in expert_names]
+    missing_paths = [str(path) for path in checkpoint_paths if not path.is_file()]
+    if missing_paths:
+        parser.error(f"selected expert checkpoint(s) not found: {missing_paths}")
+    experts, normalization = load_experts(
+        checkpoint_paths, device, expert_names=expert_names
     )
-    experts, normalization = load_experts([resolve(path) for path in checkpoint_paths], device)
 
     dataset = CaudalDataset(resolve(args.input), split=args.split)
     ids, basin_ids, labels, errors = [], [], [], []
@@ -80,7 +96,7 @@ def main():
         basin_id=np.concatenate(basin_ids).astype(np.int64),
         best_expert=np.concatenate(labels).astype(np.int64),
         expert_errors=np.concatenate(errors).astype(np.float32),
-        expert_names=np.asarray(EXPERT_NAMES), split=np.asarray(args.split),
+        expert_names=np.asarray(expert_names), split=np.asarray(args.split),
     )
     print(f"Generated {sum(len(item) for item in labels):,} {args.split} labels")
     print(f"Output: {output}")

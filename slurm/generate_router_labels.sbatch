@@ -39,14 +39,14 @@ LSTM_CHECKPOINT="${LSTM_CHECKPOINT:-checkpoints/lstm_baseline/lstm_best.pt}"
 GRU_CHECKPOINT="${GRU_CHECKPOINT:-checkpoints/gru_baseline/gru_best.pt}"
 SEQ2SEQ_CHECKPOINT="${SEQ2SEQ_CHECKPOINT:-checkpoints/seq2seq_baseline/seq2seq_attention_best.pt}"
 INFORMER_CHECKPOINT="${INFORMER_CHECKPOINT:-checkpoints/informer_baseline/informer_best.pt}"
+EXPERTS="${EXPERTS:-}"
 
-for checkpoint in "$LSTM_CHECKPOINT" "$GRU_CHECKPOINT" "$SEQ2SEQ_CHECKPOINT" "$INFORMER_CHECKPOINT"; do
-    if [ ! -f "$checkpoint" ]; then echo "Required expert checkpoint not found: $checkpoint" >&2; exit 1; fi
-done
-
-python -m scripts.generate_router_labels \
+set -- python -m scripts.generate_router_labels \
     --input "${INPUT:-Input/train-001.h5}" --split "$SPLIT" \
     --lstm-checkpoint "$LSTM_CHECKPOINT" --gru-checkpoint "$GRU_CHECKPOINT" \
     --seq2seq-checkpoint "$SEQ2SEQ_CHECKPOINT" --informer-checkpoint "$INFORMER_CHECKPOINT" \
     --batch-size "${BATCH_SIZE:-64}" --num-workers "${NUM_WORKERS:-4}" \
     --device cuda --output "$OUTPUT"
+
+if [ -n "$EXPERTS" ]; then set -- "$@" --experts "$EXPERTS"; fi
+"$@"
