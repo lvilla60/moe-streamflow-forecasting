@@ -1,0 +1,7 @@
+{
+  "assumption": "test_targets.csv Id=i corresponds to test.h5 X[i]; pending external confirmation",
+  "n_samples": 27983,
+  "mae": 0.024610487722418382,
+  "rmse": 0.11879522682049574,
+  "nse": 0.4956397392573463
+}

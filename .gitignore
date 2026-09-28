@@ -14,8 +14,28 @@ checkpoints/*
 
 outputs/*
 !outputs/.gitkeep
+!outputs/final_results/
+outputs/final_results/*
 
-# Internal documentation
-ARCHITECTURE.md
+# Lightweight final evidence; predictions, smoke outputs, and figures stay ignored.
+!outputs/final_results/validation_summary.csv
+!outputs/final_results/test_summary.csv
+!outputs/final_results/test_metrics_binary_moe.json
+!outputs/final_results/test_moe_lstm_metrics.json
+!outputs/final_results/test_persistence_metrics.json
+!outputs/final_results/router_lstm_gru_metrics.json
+!outputs/final_results/router_lstm_informer_metrics.json
+!outputs/final_results/moe_lstm_baseline_validation.json
+!outputs/final_results/moe_lstm_gru_validation.json
+!outputs/final_results/moe_lstm_informer_validation.json
+!outputs/final_results/test_moe_lstm_by_horizon.csv
+!outputs/final_results/test_persistence_by_horizon.csv
+
+# Large prediction/debug artifacts are not final versioned evidence.
+outputs/final_results/test_predictions_*.csv
+outputs/final_results/smoke_*.csv
 
 *.tar.gz
+
+# Duplicate local extraction of outputs/final_results/.
+/Final_Results/

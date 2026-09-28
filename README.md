@@ -100,7 +100,7 @@ The selected expert subset is loaded in the ordered mapping stored in the router
 
 ```text
 Input/                       HDF5 data, metadata, and optional CSV files
-notebooks/                   Data and baseline notebook
+notebooks/                   Data/baseline and final academic analysis notebooks
 scripts/
   compute_train_stats.py
   evaluate_persistence.py
@@ -270,6 +270,43 @@ truth for final evaluation only; use validation for model selection. Keep test
 targets outside version control; they are not part of the public repository.
 
 ## Experiment outputs
+
+### Final experimental extensions and results
+
+The original four-expert MoE (LSTM, GRU, Seq2Seq, Informer) was extended to
+configurable ordered expert subsets. Final two-class experiments used LSTM +
+Informer (paper-inspired recurrent/attention pairing) and LSTM + GRU (motivated by
+individual recurrent-expert validation performance). All three configurations use
+an LSTM router and select one expert per sample for all 48 forecast hours.
+
+Final held-out test results from `outputs/final_results/test_summary.csv`
+(27,983 samples; MAE/RMSE in the target units declared as mm/h in metadata):
+
+| Model | MAE | RMSE | NSE |
+|---|---:|---:|---:|
+| Persistence | 0.024610 | 0.118795 | 0.495640 |
+| MoE LSTM + Informer | 0.023453 | 0.101500 | 0.631808 |
+| MoE LSTM + GRU | 0.023377 | 0.101593 | 0.631130 |
+| Four-expert MoE, LSTM router | 0.023055 | 0.102171 | 0.626920 |
+
+All reported MoEs improve on persistence in these metrics. The four-expert MoE
+has the lowest test MAE; LSTM + Informer has the lowest test RMSE and highest NSE.
+LSTM + GRU is close on test RMSE/NSE and has the lowest validation RMSE and highest
+validation NSE among the reported models. These are descriptive comparisons,
+without statistical-significance claims.
+
+See [the final academic notebook](notebooks/final_moe_streamflow_analysis.ipynb)
+for validation tables, router analysis, per-horizon plots, and limitations.
+Training and evaluation were executed on Khipu using the wrappers under `slurm/`,
+including `slurm/predict_test.sbatch`. The Khipu section documents `NUM_WORKERS=0`
+and safe submission of comma-separated `EXPERTS` values.
+
+The explicit `.gitignore` allowlist permits the 12 lightweight summary, metric,
+and per-horizon evidence files in `outputs/final_results/` to be versioned.
+Large prediction CSVs, smoke/debug predictions, checkpoints, HDF5 inputs, local
+test targets, logs, and result archives remain excluded. The notebook retains
+rendered outputs; optional binary per-horizon analysis requires the local saved
+predictions and test targets. `smoke_test_lstm_informer.csv` is not a final result.
 
 Training and evaluation commands write compact artifacts under
 `outputs/experiments/<experiment_name>/`: `config.json` records the run settings,
@@ -481,7 +518,7 @@ with `sbatch --export=ALL,...`. Logs are written to `logs/`, checkpoints to
 
 ## 17. Generated artifacts
 
-`checkpoints/` stores expert and neural-router `.pt` files and Random Forest `.joblib` files. `outputs/` stores training statistics, persistence and MoE metrics, router-label archives, and test predictions. Generated artifacts and large datasets are excluded from Git.
+`checkpoints/` stores expert and neural-router `.pt` files and Random Forest `.joblib` files. `outputs/` stores training statistics, persistence and MoE metrics, router-label archives, and test predictions. Generated artifacts and large datasets are excluded from Git, except for the explicitly allowlisted lightweight final evidence under `outputs/final_results/`.
 
 ## 18. Methodological adaptations
 

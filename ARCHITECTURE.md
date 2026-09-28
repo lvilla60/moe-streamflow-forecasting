@@ -1,5 +1,28 @@
 # Architecture
 
+## Implementation evolution
+
+The initial full MoE used a four-class router over LSTM, GRU, Seq2Seq, and Informer
+in that order. The subsequent subset extension changes expert participation and
+the router's class count/mapping, without changing the expert architectures.
+Evaluation and test inference load only the experts identified by the ordered
+`expert_names` stored in the router artifact. Hard routing still selects one
+expert per sample for the complete 48-hour forecast.
+
+The experimental sequence was:
+
+```text
+four-class baseline -> configurable subset implementation
+    -> LSTM + Informer -> LSTM + GRU -> final held-out test comparison
+```
+
+The two-class mappings are local: `lstm,informer` means 0 = LSTM, 1 = Informer;
+`lstm,gru` means 0 = LSTM, 1 = GRU. Applying the original global class IDs to an
+arbitrary subset would misidentify experts. The mapping and legacy compatibility
+contracts are detailed below. Experimental evidence is kept in
+`outputs/final_results/`; interpretation belongs in
+`notebooks/final_moe_streamflow_analysis.ipynb`.
+
 ## Data contract
 
 Each historical input has shape `[B, 336, 12]`. Channel 11 is historical specific discharge; channels 0–10 are meteorological or hydrometeorological variables. Experts return a normalized target forecast with shape `[B, 48]`. Training and validation use the official HDF5 split, while `test.h5` has no target fields.

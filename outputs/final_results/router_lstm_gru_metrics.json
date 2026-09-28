@@ -1,0 +1,29 @@
+{
+  "kind": "router",
+  "model": "lstm",
+  "best_epoch": 8,
+  "validation_loss": 0.5389553044730965,
+  "validation_accuracy": 0.7195458053136369,
+  "confusion_matrix": [
+    [
+      9691,
+      1757
+    ],
+    [
+      3331,
+      3363
+    ]
+  ],
+  "predicted_class_frequency": [
+    13022,
+    5120
+  ],
+  "true_class_frequency": [
+    11448,
+    6694
+  ],
+  "expert_names": [
+    "lstm",
+    "gru"
+  ]
+}
